@@ -1,0 +1,48 @@
+{
+    "status": "lost_mode",
+    "batteryLevel": "0.0",
+    "uptime": 1474,
+    "errorCount": 0,
+    "firmwareVersion": "1.2.0",
+    "network": {
+        "signalQuality": 4,
+        "csqRaw": 18,
+        "signalStrength": 18,
+        "operator": "WINDTRE",
+        "networkType": "LTE-M",
+        "connectionState": "connected",
+        "connectionRetries": 0,
+        "isConnected": true,
+        "isGprsConnected": true,
+        "localIP": "10.8.76.34",
+        "lastSuccessfulHeartbeat": 32,
+        "heartbeatInterval": 30
+    },
+    "gps": {
+        "enabled": true,
+        "fixed": false,
+        "dataValid": false,
+        "satellites": 0,
+        "hdop": "1.00",
+        "lastFixAge": 4294967295,
+        "hardwareStatus": "powered_on",
+        "lastReadAttempt": 1477,
+        "lostModeActive": true,
+        "geofenceActive": false,
+        "singleLocationPending": false
+    },
+    "config": {
+        "heartbeatInterval": 30000,
+        "gpsReadInterval": 0,
+        "lostModeInterval": 15000,
+        "lowBatteryThreshold": 15
+    },
+    "system": {
+        "freeHeap": 281708,
+        "totalHeap": 329908,
+        "heapUsage": 15,
+        "cpuFreq": 240,
+        "flashSize": 16777216
+    },
+    "timestamp": "25/06/20,23:51:55+08"
+}
