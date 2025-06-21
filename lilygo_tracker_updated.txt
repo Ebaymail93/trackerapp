@@ -1,0 +1,2459 @@
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <esp_sleep.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <ArduinoHttpClient.h>
+
+// Pin configuration per LilyGO T-SIM7000G
+#define UART_BAUD           9600
+#define PIN_DTR             25
+#define PIN_TX              27
+#define PIN_RX              26
+#define PWR_PIN             4
+#define LED_PIN             12
+#define BAT_ADC             35
+
+// SIM7000G modem configuration
+#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_RX_BUFFER  1024
+#define TINY_GSM_DEBUG      Serial
+
+#define DEEP_SLEEP_DURATION 3600  // 1 ora in secondi
+
+#include <TinyGsmClient.h>
+
+// Configuration structure - Aggiornata per API server
+struct Config {
+  String deviceId = "";
+  String deviceName = "LilyGO T-SIM7000G Tracker";
+  String serverURL = "109.117.107.245";
+  String apn = "simbase";
+  String apnUser = "";
+  String apnPass = "";
+  uint32_t heartbeatInterval = 300000;  // ✅ 5 minuti, non 5000
+  uint32_t gpsReadInterval = 0;
+  uint32_t lostModeInterval = 15000;
+  float lowBatteryThreshold = 15.0;
+  uint8_t maxRetries = 3;
+  bool useHTTPS = false;
+  int serverPort = 3000;
+  String firmwareVersion = "1.2.0";
+  String hardwareVersion = "LilyGO T-SIM7000G v1.3";
+};
+
+// Enhanced state management
+enum SystemState {
+  STATE_INIT,
+  STATE_READY,
+  STATE_GPS_ACQUIRING,
+  STATE_NETWORK_CONNECTING,
+  STATE_ONLINE,
+  STATE_ERROR,
+  STATE_SLEEP_PREP,
+  STATE_SLEEP
+};
+
+enum NetworkState {
+  NET_DISCONNECTED,
+  NET_CONNECTING,
+  NET_CONNECTED,
+  NET_ERROR
+};
+
+enum RegistrationState {
+  REG_NOT_STARTED,
+  REG_REGISTERING,
+  REG_COMPLETED,
+  REG_ERROR
+};
+
+// Status variables
+struct SystemStatus {
+  SystemState state = STATE_INIT;
+  NetworkState networkState = NET_DISCONNECTED;
+  RegistrationState registrationState = REG_NOT_STARTED;
+  bool isGPSFixed = false;
+  bool lostModeEnabled = false;
+  bool geofencingEnabled = false;
+  bool gpsEnabled = false;
+  bool sendSingleLocation = false;
+  float batteryLevel = 0.0;
+  int signalQuality = 0;
+  uint8_t connectionRetries = 0;
+  uint32_t lastHeartbeat = 0;
+  uint32_t lastGPSRead = 0;
+  uint32_t lastStatusUpdate = 0;
+  uint32_t errorCount = 0;
+  uint32_t uptime = 0;
+  bool httpInProgress = false;
+  String deviceUUID = "";
+};
+
+// GPS data structure
+struct GPSInfo {
+    bool isValid = false;
+    float latitude = 0.0;
+    float longitude = 0.0;
+    float altitude = 0.0;
+    float speed = 0.0;
+    float heading = 0.0;
+    int satellites = 0;
+    float hdop = 1.0;
+    String datetime = "";
+    uint32_t timestamp = 0;
+    
+    bool isValidCoordinate() const {
+        return (latitude >= -90.0 && latitude <= 90.0 && longitude >= -180.0 && longitude <= 180.0 && 
+                latitude != 0.0 && longitude != 0.0);
+    }
+};
+
+// Struttura per comandi ricevuti dal server
+struct ServerCommand {
+    String id;
+    String commandType;
+    String commandData;
+    String status;
+    String createdAt;
+};
+
+Config config;
+SystemStatus status;
+GPSInfo gpsData;
+
+
+// GPS e GSM setup
+HardwareSerial SerialAT(1);
+TinyGsm modem(SerialAT);
+Preferences prefs;
+TinyGsmClient client(modem);
+HttpClient http(client, config.serverURL.c_str(), config.serverPort);  
+
+// Constants
+const uint32_t STATUS_UPDATE_INTERVAL = 2000;
+const uint32_t MAX_HTTP_TIMEOUT = 15000;
+const uint32_t NETWORK_RETRY_DELAY = 30000;
+const uint32_t GPS_TIMEOUT = 5000;
+
+// Function declarations
+void initializeSystem();
+bool initializePower();
+bool initializeModem();
+bool connectToNetwork();
+void handleStateMachine();
+void readGPS();
+void handleSerialCommands();
+void handleNetworkOperations();
+void sendHeartbeatAndCheckCommands();
+void sendLocationUpdate();
+bool checkDeviceExists();
+bool registerDevice();
+void processServerCommands(JsonArray commands);
+void executeCommand(const ServerCommand& cmd);  // ✅ CORRETTA
+void acknowledgeCommand(const String& commandId, const String& status, const String& result);
+void enableLostMode();
+void disableLostMode();
+void sendImmediateLocation();
+void handleGeofenceAlert();
+void readBatteryLevel();
+void updateStatusLED();
+void enterSleepMode();
+void handleError(const String& error);
+void printSystemInfo();
+void saveConfigToNVS();
+void loadConfigFromNVS();
+bool enableGPS();
+void disableGPS();
+bool makeHttpRequest(const String& method, const String& url, const String& payload, String& response);
+GPSInfo getGPSInfo(); 
+bool parseGNSSResponse(const String& response);
+int splitString(const String& data, char separator, String* parts, int maxParts);
+bool sendCommand(const String& command, int timeout);
+void handleDeviceRegistrationFlow();
+void handleNormalOperations(uint32_t currentTime);
+void printRegistrationStatus();
+String getDeviceMAC();
+bool sendWithRetry(const String& method, const String& url, const String& payload, String& response, int maxRetries = 3);
+int getSignalQuality();
+void checkGPSAutoStart();
+
+
+void setup() {
+    Serial.begin(9600);
+    delay(1000);
+    
+    Serial.println("=== GPS TRACKER T-SIM7000G - SERVER INTEGRATION ===");
+    Serial.println("=== Versione firmware: " + config.firmwareVersion + " ===");
+    
+    prefs.begin("gps-tracker", false);
+    loadConfigFromNVS();
+    
+    // Genera Device ID univoco basato su MAC
+    if (config.deviceId.length() == 0) {
+        config.deviceId = getDeviceMAC();
+        saveConfigToNVS();
+    }
+    
+    Serial.println("🆔 Device ID (MAC): " + config.deviceId);
+    Serial.println("🌐 Server: http://" + config.serverURL + ":" + String(config.serverPort));
+    
+    initializeSystem();
+    
+    Serial.println("🔍 Controllo necessità GPS all'avvio...");
+    checkGPSAutoStart();
+    
+    Serial.println("✅ Sistema inizializzato - avvio state machine");
+    status.state = STATE_READY;
+}
+
+void loop() {
+    uint32_t currentTime = millis();
+    status.uptime = currentTime;
+    
+    handleSerialCommands();
+    
+    // Debug periodico
+    static uint32_t lastDebug = 0;
+    if (currentTime - lastDebug > 60000) {
+        printRegistrationStatus();
+        
+        // ✅ DEBUG ENTRAMBE LE MODALITÀ
+        if (status.lostModeEnabled) {
+            Serial.printf("🚨 Lost Mode: GPS=%s, Fixed=%s, LastRead=%lu ms ago\n",
+                         status.gpsEnabled ? "ON" : "OFF",
+                         status.isGPSFixed ? "YES" : "NO",
+                         currentTime - status.lastGPSRead);
+        }
+        if (status.geofencingEnabled) {
+            Serial.printf("🌍 Geofencing: GPS=%s, Fixed=%s, Interval=%d ms\n",
+                         status.gpsEnabled ? "ON" : "OFF",
+                         status.isGPSFixed ? "YES" : "NO",
+                         config.gpsReadInterval);
+        }
+        
+        lastDebug = currentTime;
+    }
+    
+    if (status.httpInProgress) {
+        delay(100);
+        return;
+    }
+
+    handleStateMachine();
+    
+    // Aggiornamento status LED e batteria
+    if (currentTime - status.lastStatusUpdate >= STATUS_UPDATE_INTERVAL) {
+        updateStatusLED();
+        readBatteryLevel();
+        status.lastStatusUpdate = currentTime;
+    }
+    
+    // ✅ LOGICA GPS CORRETTA CON FLAG DEDICATI
+    if (status.gpsEnabled) {
+        uint32_t gpsInterval = 0;
+        String reason = "";
+        
+        // ✅ PRIORITÀ: Lost Mode (intervallo più frequente)
+        if (status.lostModeEnabled) {
+            gpsInterval = config.lostModeInterval;
+            reason = "lost_mode";
+        }
+        // ✅ GEOFENCING: Usa gpsReadInterval dalle config
+        else if (status.geofencingEnabled && config.gpsReadInterval > 0) {
+            gpsInterval = config.gpsReadInterval;
+            reason = "geofencing";
+        }
+        
+        bool shouldReadGPS = false;
+        
+        if (gpsInterval > 0 && currentTime - status.lastGPSRead >= gpsInterval) {
+            shouldReadGPS = true;
+        }
+        
+        if (status.sendSingleLocation) {
+            shouldReadGPS = true;
+            reason = "single_request";
+        }
+        
+        if (shouldReadGPS && status.state == STATE_ONLINE) {
+            Serial.printf("📍 Lettura GPS per: %s\n", reason.c_str());
+            
+            readGPS();
+            status.lastGPSRead = currentTime;
+            
+            // Invia posizione se GPS valido
+            if (status.isGPSFixed && gpsData.isValid) {
+                Serial.printf("✅ Invio posizione: %.6f,%.6f\n", gpsData.latitude, gpsData.longitude);
+                sendLocationUpdate();
+                
+                // Se era una richiesta singola, gestisci di conseguenza
+                if (status.sendSingleLocation) {
+                    status.sendSingleLocation = false;
+                    // Spegni GPS solo se non serve per altre modalità
+                    if (!status.lostModeEnabled && !status.geofencingEnabled) {
+                        disableGPS();
+                        Serial.println("📍 Posizione singola inviata - GPS spento");
+                    }
+                }
+            } else {
+                Serial.printf("❌ GPS non pronto: Fixed=%s, Valid=%s, Sats=%d\n",
+                             status.isGPSFixed ? "SI" : "NO",
+                             gpsData.isValid ? "SI" : "NO",
+                             gpsData.satellites);
+            }
+        }
+    }
+
+    handleNetworkOperations();
+    
+    // Heartbeat unificato (include controllo comandi) - solo se registrato
+    if (status.registrationState == REG_COMPLETED && 
+        currentTime - status.lastHeartbeat >= config.heartbeatInterval) {
+        if (status.networkState == NET_CONNECTED && !status.httpInProgress) {
+            sendHeartbeatAndCheckCommands();
+        }
+        status.lastHeartbeat = currentTime;
+    }
+    
+    // Controllo batteria bassa
+    if (status.batteryLevel < config.lowBatteryThreshold && status.batteryLevel > 0.0) {
+        if (!status.lostModeEnabled && !status.geofencingEnabled ) {
+            Serial.println("🔋 Batteria bassa - preparazione sleep mode");
+            status.state = STATE_SLEEP_PREP;
+        }
+    }
+    
+    // ⚠️ MIGLIORATO: Error count più alto per GPS timeout
+    if (status.errorCount > 15) {  // Era 10, ora 15
+        Serial.println("💥 Troppi errori - restart del sistema");
+        Serial.printf("📊 Error details: Count=%d, GPS enabled=%s, Network=%s\n", 
+                     status.errorCount, 
+                     status.gpsEnabled ? "SI" : "NO",
+                     modem.isNetworkConnected() ? "SI" : "NO");
+        ESP.restart();
+    }
+    
+    delay(200);
+}
+
+void printGPSStatus() {
+    Serial.println("🛰️ === STATUS GPS ===");
+    Serial.printf("GPS Enabled (software): %s\n", status.gpsEnabled ? "SI" : "NO");
+    Serial.printf("GPS Fixed: %s\n", status.isGPSFixed ? "SI" : "NO");
+    Serial.printf("Lost Mode: %s\n", status.lostModeEnabled ? "SI" : "NO");
+    Serial.printf("Geofence Interval: %d ms\n", config.gpsReadInterval);
+    Serial.printf("Single Location: %s\n", status.sendSingleLocation ? "SI" : "NO");
+    
+    if (status.gpsEnabled) {
+        Serial.printf("GPS Data Valid: %s\n", gpsData.isValid ? "SI" : "NO");
+        if (gpsData.isValid) {
+            Serial.printf("Coordinates: %.6f, %.6f\n", gpsData.latitude, gpsData.longitude);
+            Serial.printf("Satellites: %d, HDOP: %.1f\n", gpsData.satellites, gpsData.hdop);
+        }
+    }
+    
+    // Verifica hardware GPS
+    SerialAT.println("AT+CGNSPWR?");
+    delay(1000);
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("GPS Hardware: " + response.substring(response.indexOf("+CGNSPWR:")));
+    }
+    Serial.println("=====================");
+}
+
+void debugGPSComplete() {
+    Serial.println("🔍 === DEBUG COMPLETO GPS ===");
+    
+    // 1. Test comunicazione base
+    Serial.println("1️⃣ Test comunicazione AT...");
+    SerialAT.println("AT");
+    delay(1000);
+    if (SerialAT.available()) {
+        Serial.println("✅ Comunicazione: " + SerialAT.readString());
+    } else {
+        Serial.println("❌ Nessuna comunicazione con modem");
+        return;
+    }
+    
+    // 2. Verifica stato GPS
+    Serial.println("2️⃣ Stato GPS...");
+    SerialAT.println("AT+CGNSPWR?");
+    delay(1000);
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("GPS Power: " + response);
+        if (response.indexOf("+CGNSPWR: 0") >= 0) {
+            Serial.println("⚠️ GPS è SPENTO");
+        } else if (response.indexOf("+CGNSPWR: 1") >= 0) {
+            Serial.println("✅ GPS è ACCESO");
+        }
+    }
+    
+    // 3. Informazioni dettagliate GPS
+    Serial.println("3️⃣ Informazioni GPS dettagliate...");
+    SerialAT.println("AT+CGNSINF");
+    delay(3000);
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("GPS Info RAW:");
+        Serial.println(response);
+        
+        // Parse dettagliato
+        if (response.indexOf("+CGNSINF:") >= 0) {
+            int start = response.indexOf("+CGNSINF: ");
+            start += 10;
+            int end = response.indexOf("\r", start);
+            if (end == -1) end = response.indexOf("\n", start);
+            
+            String data = response.substring(start, end);
+            Serial.println("📊 Dati GPS parsed: " + data);
+            
+            String parts[20];
+            int partCount = splitString(data, ',', parts, 20);
+            
+            if (partCount >= 15) {
+                Serial.println("📋 === ANALISI DETTAGLIATA ===");
+                Serial.printf("GNSS Run Status: %s (1=running, 0=stopped)\n", parts[0].c_str());
+                Serial.printf("Fix Status: %s (1=fixed, 0=not fixed)\n", parts[1].c_str());
+                Serial.printf("UTC Date&Time: %s\n", parts[2].c_str());
+                Serial.printf("Latitude: %s\n", parts[3].c_str());
+                Serial.printf("Longitude: %s\n", parts[4].c_str());
+                Serial.printf("MSL Altitude: %s\n", parts[5].c_str());
+                Serial.printf("Speed Over Ground: %s\n", parts[6].c_str());
+                Serial.printf("Course Over Ground: %s\n", parts[7].c_str());
+                Serial.printf("Fix Mode: %s (1=no fix, 2=2D, 3=3D)\n", parts[8].c_str());
+                Serial.printf("HDOP: %s\n", parts[10].c_str());
+                Serial.printf("PDOP: %s\n", parts[11].c_str());
+                Serial.printf("VDOP: %s\n", parts[12].c_str());
+                Serial.printf("GPS Satellites in View: %s\n", parts[14].c_str());
+                Serial.printf("GNSS Satellites Used: %s\n", parts[15].c_str());
+                
+                // Diagnosi
+                int gnssStatus = parts[0].toInt();
+                int fixStatus = parts[1].toInt();
+                int fixMode = parts[8].toInt();
+                int satsInView = parts[14].toInt();
+                int satsUsed = parts[15].toInt();
+                
+                Serial.println("\n🔍 === DIAGNOSI ===");
+                if (gnssStatus == 0) {
+                    Serial.println("❌ PROBLEMA: GNSS non in esecuzione");
+                    Serial.println("💡 SOLUZIONE: Riattivare GPS");
+                } else if (fixStatus == 0) {
+                    Serial.println("⏳ GPS in esecuzione ma senza fix");
+                    if (satsInView == 0) {
+                        Serial.println("❌ PROBLEMA: Nessun satellite visibile");
+                        Serial.println("💡 SOLUZIONI:");
+                        Serial.println("   - Verifica antenna GPS collegata");
+                        Serial.println("   - Sposta all'aperto");
+                        Serial.println("   - Attendi 5-15 minuti per cold start");
+                    } else if (satsInView < 4) {
+                        Serial.printf("⚠️ PROBLEMA: Pochi satelliti (%d < 4)\n", satsInView);
+                        Serial.println("💡 SOLUZIONI:");
+                        Serial.println("   - Migliora posizione (più aperto)");
+                        Serial.println("   - Attendi più satelliti");
+                    } else {
+                        Serial.printf("🛰️ Satelliti sufficienti (%d), ma fix in corso...\n", satsInView);
+                        Serial.println("💡 Attendi ancora 2-5 minuti");
+                    }
+                } else {
+                    Serial.println("✅ GPS ha FIX!");
+                    Serial.printf("📍 Posizione: %s, %s\n", parts[3].c_str(), parts[4].c_str());
+                }
+            }
+        }
+    }
+    
+    // 4. Test configurazione antenna (se supportata)
+    Serial.println("4️⃣ Test configurazione antenna...");
+    SerialAT.println("AT+CGPIO=0,48,1,1");
+    delay(2000);
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("Antenna Config: " + response);
+        if (response.indexOf("ERROR") >= 0) {
+            Serial.println("⚠️ Configurazione antenna non supportata (normale)");
+        }
+    }
+    
+    // 5. Informazioni modem
+    Serial.println("5️⃣ Info modem e segnale...");
+    SerialAT.println("AT+CSQ");
+    delay(1000);
+    if (SerialAT.available()) {
+        Serial.println("Signal Quality: " + SerialAT.readString());
+    }
+    
+    Serial.println("===============================");
+}
+
+
+void handleSerialCommands() {
+    if (Serial.available()) {
+        String command = Serial.readString();
+        command.trim();
+        
+        if (command == "GPS_DEBUG") {
+            debugGPSComplete();
+        }
+        else if (command.startsWith("AT+")) {
+            Serial.println("📡 Invio comando AT: " + command);
+            SerialAT.println(command);
+            delay(2000);
+            
+            if (SerialAT.available()) {
+                String response = SerialAT.readString();
+                Serial.println("📄 Risposta:");
+                Serial.println(response);
+            } else {
+                Serial.println("❌ Nessuna risposta");
+            }
+        }
+        else if (command == "GPS_SYNC") {
+            Serial.println("🔄 Sincronizzazione stato GPS...");
+            
+            // Forza lettura GPS e aggiornamento stato
+            GPSInfo gps = getGPSInfo();
+            
+            Serial.printf("📊 Risultato sync: GPS Fix = %s, Coordinate valide = %s\n",
+                         status.isGPSFixed ? "SI" : "NO",
+                         gpsData.isValid ? "SI" : "NO");
+            
+            if (gpsData.isValid) {
+                Serial.printf("📍 Coordinate: %.6f, %.6f\n", gpsData.latitude, gpsData.longitude);
+            }
+        }
+        
+        // ⚠️ MIGLIORATO: FORCE_LOCATION con sync
+        else if (command == "FORCE_LOCATION") {
+            Serial.println("📍 Invio posizione forzato...");
+            
+            // Prima forza sync
+            Serial.println("🔄 Sync GPS prima dell'invio...");
+            GPSInfo gps = getGPSInfo();
+            
+            if (status.isGPSFixed && gpsData.isValid) {
+                Serial.printf("✅ GPS OK: %.6f, %.6f\n", gpsData.latitude, gpsData.longitude);
+                sendLocationUpdate();
+            } else {
+                Serial.printf("❌ GPS non ha fix - Status: Fixed=%s, Valid=%s, Sats=%d\n",
+                             status.isGPSFixed ? "SI" : "NO",
+                             gpsData.isValid ? "SI" : "NO",
+                             gpsData.satellites);
+            }
+        }
+        
+        // ⚠️ NUOVO: Debug lost mode
+        else if (command == "LOST_STATUS") {
+            Serial.println("🚨 === LOST MODE STATUS ===");
+            Serial.printf("Lost Mode Enabled: %s\n", status.lostModeEnabled ? "SI" : "NO");
+            Serial.printf("GPS Enabled: %s\n", status.gpsEnabled ? "SI" : "NO");
+            Serial.printf("GPS Fixed: %s\n", status.isGPSFixed ? "SI" : "NO");
+            Serial.printf("GPS Data Valid: %s\n", gpsData.isValid ? "SI" : "NO");
+            Serial.printf("System State: %d\n", status.state);
+            Serial.printf("Network State: %d\n", status.networkState);
+            Serial.printf("Registration: %d\n", status.registrationState);
+            Serial.printf("Lost Mode Interval: %d ms\n", config.lostModeInterval);
+            Serial.printf("Last GPS Read: %lu ms ago\n", millis() - status.lastGPSRead);
+            
+            if (gpsData.isValid) {
+                Serial.printf("Coordinates: %.6f, %.6f\n", gpsData.latitude, gpsData.longitude);
+            }
+            Serial.println("===========================");
+        }
+        else if (command == "FORCE_LOST_SEND") {
+            if (status.lostModeEnabled) {
+                Serial.println("🚨 Forza invio posizione lost mode...");
+                
+                // Forza sync GPS
+                GPSInfo gps = getGPSInfo();
+                
+                if (status.isGPSFixed && gpsData.isValid) {
+                    sendLocationUpdate();
+                    Serial.println("✅ Posizione inviata");
+                } else {
+                    Serial.println("❌ GPS non pronto");
+                }
+            } else {
+                Serial.println("❌ Lost mode non attiva");
+            }
+        }
+        else if (command == "GPS_FORCE_ON") {
+            Serial.println("🔄 Forzatura attivazione GPS...");
+            SerialAT.println("AT+CGNSPWR=0");
+            delay(3000);
+            SerialAT.println("AT+CGNSPWR=1");
+            delay(2000);
+            status.gpsEnabled = true;
+            Serial.println("✅ GPS forzato ON");
+        }
+        else if (command == "GPS_COLD_START") {
+            Serial.println("🔄 GPS Cold Start (reset completo)...");
+            SerialAT.println("AT+CGNSPWR=0");
+            delay(3000);
+            SerialAT.println("AT+CGNSCOLD");  // Cold start
+            delay(5000);
+            SerialAT.println("AT+CGNSPWR=1");
+            delay(2000);
+            Serial.println("✅ GPS Cold Start completato");
+        }
+        else if (command == "GPS_HOT_START") {
+            Serial.println("🔄 GPS Hot Start...");
+            SerialAT.println("AT+CGNSHOT");  // Hot start
+            delay(2000);
+            Serial.println("✅ GPS Hot Start completato");
+        }
+        else if (command == "RESET_CONFIG") {
+            Serial.println("🔄 Reset configurazione...");
+            prefs.clear();
+            ESP.restart();
+        }
+        else if (command == "TEST_GPS") {
+            Serial.println("🧪 === TEST GPS ===");
+            
+            if (!status.gpsEnabled) {
+                Serial.println("❌ GPS non attivo");
+                return;
+            }
+            
+            Serial.println("📡 Richiesta informazioni GPS...");
+            SerialAT.println("AT+CGNSINF");
+            delay(3000);
+            
+            if (SerialAT.available()) {
+                String response = SerialAT.readString();
+                Serial.println("📄 Risposta GPS:");
+                Serial.println(response);
+            }
+        }
+        else if (command == "ENABLE_GPS") {
+            if (enableGPS()) {
+                Serial.println("✅ GPS attivato manualmente");
+            } else {
+                Serial.println("❌ Errore attivazione GPS");
+            }
+        }
+        else if (command == "DISABLE_GPS") {
+            disableGPS();
+            Serial.println("🔒 GPS disattivato manualmente");
+        }
+        else if (command == "STATUS") {
+            printRegistrationStatus();
+        }
+        else if (command == "GPS_STATUS") {
+            printGPSStatus();
+        }
+        else if (command == "GPS_CHECK_AUTO") {
+            checkGPSAutoStart();
+        }
+        else if (command == "GPS_RESTART") {
+            Serial.println("🔄 Restart GPS forzato...");
+            sendCommand("AT+CGNSPWR=0", 3000);
+            status.gpsEnabled = false;
+            delay(5000);
+            if (enableGPS()) {
+                Serial.println("✅ GPS riavviato");
+            } else {
+                Serial.println("❌ Errore riavvio GPS");
+            }
+        }
+        else if (command == "NETWORK_STATUS") {
+            Serial.println("🌐 === NETWORK STATUS ===");
+            Serial.printf("Network Connected: %s\n", modem.isNetworkConnected() ? "SI" : "NO");
+            Serial.printf("GPRS Connected: %s\n", modem.isGprsConnected() ? "SI" : "NO");
+            Serial.printf("Operator: %s\n", modem.getOperator().c_str());
+            Serial.printf("IP: %s\n", modem.localIP().toString().c_str());
+            Serial.printf("Signal: %d/31\n", modem.getSignalQuality());
+            Serial.println("========================");
+        }
+        else if (command == "FORCE_LOCATION") {
+            Serial.println("📍 Invio posizione forzato...");
+            if (status.isGPSFixed && gpsData.isValid) {
+                sendLocationUpdate();
+            } else {
+                Serial.println("❌ GPS non ha fix - impossibile inviare");
+            }
+        }
+        else if (command == "HEARTBEAT_TEST") {
+            Serial.println("🧪 Test heartbeat esteso...");
+            sendHeartbeatAndCheckCommands();
+        }
+        else if (command == "NETWORK_INFO") {
+            Serial.println("📶 === NETWORK INFO DETTAGLIATO ===");
+            Serial.printf("Network Type: %s\n", getNetworkType().c_str());
+            Serial.printf("Network State: %s\n", getNetworkStateString().c_str());
+            Serial.printf("Signal Quality: %d/5 (CSQ: %d)\n", getSignalQuality(), modem.getSignalQuality());
+            Serial.printf("Operator: %s\n", modem.getOperator().c_str());
+            Serial.printf("Local IP: %s\n", modem.getLocalIP().c_str());
+            Serial.printf("Connected: %s\n", modem.isNetworkConnected() ? "YES" : "NO");
+            Serial.printf("GPRS Connected: %s\n", modem.isGprsConnected() ? "YES" : "NO");
+        }
+        else if (command == "GPS_INFO") {
+            Serial.println("🛰️ === GPS INFO DETTAGLIATO ===");
+            Serial.printf("GPS Enabled: %s\n", status.gpsEnabled ? "YES" : "NO");
+            Serial.printf("GPS Fixed: %s\n", status.isGPSFixed ? "YES" : "NO");
+            Serial.printf("Data Valid: %s\n", gpsData.isValid ? "YES" : "NO");
+            Serial.printf("Satellites: %d\n", gpsData.satellites);
+            Serial.printf("HDOP: %.2f\n", gpsData.hdop);
+            Serial.printf("Hardware Status: %s\n", getGPSHardwareStatus().c_str());
+            if (gpsData.isValid) {
+                Serial.printf("Position: %.6f, %.6f\n", gpsData.latitude, gpsData.longitude);
+                Serial.printf("Altitude: %.1fm\n", gpsData.altitude);
+                Serial.printf("Speed: %.1f km/h\n", gpsData.speed);
+            }
+        }
+        else if (command == "HELP") {
+            Serial.println("📚 Comandi disponibili:");
+            Serial.println("  ENABLE_GPS     - Attiva GPS");
+            Serial.println("  DISABLE_GPS    - Disattiva GPS");
+            Serial.println("  GPS_RESTART    - Restart GPS forzato");
+            Serial.println("  GPS_SYNC       - Sincronizza stato GPS");
+            Serial.println("  TEST_GPS       - Test GPS");
+            Serial.println("  GPS_DEBUG      - Debug GPS completo");
+            Serial.println("  LOST_STATUS    - Status lost mode");
+            Serial.println("  FORCE_LOST_SEND- Forza invio lost mode");
+            Serial.println("  STATUS         - Status sistema");
+            Serial.println("  RECOVERY       - Status recovery");
+            Serial.println("  GPS_STATUS     - Status GPS dettagliato");
+            Serial.println("  NETWORK_STATUS - Status rete");
+            Serial.println("  FORCE_LOCATION - Invia posizione ora");
+            Serial.println("  RESET_CONFIG   - Reset configurazione");
+        }
+    }
+}
+
+String getDeviceMAC() {
+    uint64_t chipid = ESP.getEfuseMac();
+    return String("LILYGO_") + 
+           String((uint16_t)(chipid >> 32), HEX) + "_" +
+           String((uint32_t)chipid, HEX);
+}
+
+
+void initializeSystem() {
+    Serial.println("=== INIZIALIZZAZIONE SISTEMA LilyGO T-SIM7000G ===");
+    
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(PWR_PIN, OUTPUT);
+    pinMode(BAT_ADC, INPUT);
+    pinMode(PIN_DTR, OUTPUT);
+    
+    digitalWrite(LED_PIN, HIGH);
+    
+    WiFi.mode(WIFI_OFF);
+    WiFi.disconnect(true);
+    
+    Serial.println("=== FASE 1: Inizializzazione UART ===");
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+    delay(1000);
+    
+    Serial.println("=== FASE 2: Accensione modem ===");
+    if (!initializePower()) {
+        handleError("Errore inizializzazione alimentazione");
+        return;
+    }
+    
+    Serial.println("=== FASE 3: Inizializzazione modem ===");
+    if (!initializeModem()) {
+        handleError("Errore inizializzazione modem");
+        digitalWrite(LED_PIN, LOW);
+        return;
+    }
+    
+    Serial.println("=== FASE 4: GPS spento di default ===");
+    // GPS rimane spento finché non viene richiesto tramite comando
+    Serial.println("🔒 GPS spento - verrà attivato solo su richiesta comandi");
+    
+    readBatteryLevel();
+    
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("✅ === SISTEMA INIZIALIZZATO CON SUCCESSO ===");
+    printSystemInfo();
+}
+
+bool initializePower() {
+    Serial.println("=== SEQUENZA ACCENSIONE SIM7000G ===");
+    
+    digitalWrite(PWR_PIN, HIGH);
+    Serial.println("PWR_PIN HIGH");
+    
+    delay(1000);
+    digitalWrite(PWR_PIN, LOW);
+    Serial.println("PWR_PIN LOW - Modem dovrebbe accendersi");
+    
+    Serial.println("Attesa avvio modem...");
+    delay(3000);
+    
+    Serial.println("✅ Sequenza accensione completata");
+    return true;
+}
+
+bool initializeModem() {
+    Serial.println("=== INIZIALIZZAZIONE MODEM SIM7000G ===");
+    
+    Serial.println("Restart del modem tramite TinyGSM...");
+    
+    if (!modem.restart()) {
+        Serial.println("Restart fallito, tentativo con init...");
+        if (!modem.init()) {
+            Serial.println("❌ ERRORE: Modem non inizializzato");
+            return false;
+        }
+    }
+    
+    Serial.println("✅ Modem inizializzato tramite TinyGSM!");
+    
+    String modemInfo = modem.getModemInfo();
+    Serial.printf("📱 Info modem: %s\n", modemInfo.c_str());
+    
+    int signalQuality = modem.getSignalQuality();
+    Serial.printf("📶 Qualità segnale: %d/31\n", signalQuality);
+    
+    if (signalQuality == 99) {
+        Serial.println("⚠️ WARNING: Nessun segnale rilevato");
+    }
+    
+    return true;
+}
+
+bool enableGPS() {
+    // ⚠️ CONTROLLO: Se GPS già attivo, non fare nulla
+    if (status.gpsEnabled) {
+        Serial.println("✅ GPS già attivo - skip attivazione");
+        return true;
+    }
+    
+    Serial.println("🛰️ === ATTIVAZIONE GPS ===");
+    
+    // Test comunicazione
+    if (!sendCommand("AT", 3000)) {
+        Serial.println("❌ Comunicazione FALLITA");
+        return false;
+    }
+    Serial.println("✅ Comunicazione OK");
+    
+    // Verifica stato GPS corrente via AT command
+    Serial.println("🔍 Verifica stato GPS hardware...");
+    SerialAT.println("AT+CGNSPWR?");
+    delay(2000);
+    bool gpsHardwareActive = false;
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("GPS Status: " + response);
+        if (response.indexOf("+CGNSPWR: 1") >= 0) {
+            gpsHardwareActive = true;
+            Serial.println("✅ GPS hardware già attivo");
+        }
+    }
+    
+    // Attiva solo se necessario
+    if (!gpsHardwareActive) {
+        // Spegni GPS prima di riconfigurare
+        Serial.println("🔒 Reset GPS...");
+        sendCommand("AT+CGNSPWR=0", 3000);
+        delay(3000);
+        
+        // Attiva GPS
+        Serial.println("🛰️ Attivazione GPS...");
+        if (!sendCommand("AT+CGNSPWR=1", 10000)) {
+            Serial.println("❌ Errore attivazione GPS");
+            status.gpsEnabled = false;
+            return false;
+        }
+    }
+    
+    Serial.println("✅ GPS attivato!");
+    status.gpsEnabled = true;
+    
+    // Verifica finale
+    delay(2000);
+    SerialAT.println("AT+CGNSPWR?");
+    delay(1000);
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        Serial.println("Verifica finale: " + response);
+    }
+    
+    return true;
+}
+
+
+void disableGPS() {
+    // ✅ CONTROLLA TUTTI I FLAG PER DECIDERE SE SPEGNERE GPS
+    bool shouldStayOn = false;
+    String reason = "";
+    
+    if (status.lostModeEnabled) {
+        shouldStayOn = true;
+        reason += "lost_mode ";
+    }
+    if (status.geofencingEnabled) { 
+        shouldStayOn = true;
+        reason += "geofencing ";
+    }
+    if (status.sendSingleLocation) {
+        shouldStayOn = true;
+        reason += "single_location ";
+    }
+    
+    if (shouldStayOn) {
+        Serial.printf("🔒 GPS mantieni attivo per: %s\n", reason.c_str());
+        return;
+    }
+    
+    Serial.println("🔒 === SPEGNIMENTO GPS ===");
+    sendCommand("AT+CGNSPWR=0", 3000);
+    status.gpsEnabled = false;
+    status.isGPSFixed = false;
+    gpsData.isValid = false;
+    Serial.println("✅ GPS spento");
+}
+
+// 3. FUNZIONE PER CONTROLLO AUTOMATICO GPS ALL'AVVIO
+void checkGPSAutoStart() {
+    Serial.println("🔍 === CONTROLLO GPS AUTO-START ===");
+    
+    bool needsGPS = false;
+    String reasons = "";
+    
+    // ✅ CONTROLLA ENTRAMBI I FLAG
+    if (status.lostModeEnabled) {
+        needsGPS = true;
+        reasons += "lost_mode ";
+        Serial.println("🚨 Lost mode attiva - GPS necessario");
+    }
+    
+    if (status.geofencingEnabled) {
+        needsGPS = true;
+        reasons += "geofencing ";
+        Serial.printf("🌍 Geofencing attivo (intervallo: %d ms) - GPS necessario\n", 
+                     config.gpsReadInterval);
+    }
+    
+    if (needsGPS) {
+        Serial.printf("🛰️ Avvio automatico GPS per: %s\n", reasons.c_str());
+        if (enableGPS()) {
+            Serial.println("✅ GPS avviato automaticamente");
+        } else {
+            Serial.println("❌ Errore avvio automatico GPS");
+        }
+    } else {
+        Serial.println("🔒 GPS non necessario - rimane spento");
+    }
+}
+
+
+bool sendCommand(const String& command, int timeout) {
+    SerialAT.println(command);
+    
+    String response = "";
+    unsigned long start = millis();
+    
+    while (millis() - start < timeout) {
+        if (SerialAT.available()) {
+            char c = SerialAT.read();
+            response += c;
+            
+            if (response.indexOf("OK") >= 0) {
+                return true;
+            }
+            if (response.indexOf("ERROR") >= 0) {
+                return false;
+            }
+        }
+    }
+    
+    return false;
+}
+
+GPSInfo getGPSInfo() {
+    GPSInfo info = {0};
+    
+    if (!status.gpsEnabled) {
+        Serial.println("⚠️ GPS non abilitato");
+        status.isGPSFixed = false;
+        info.satellites = 0;  // ✅ Esplicito: 0 satelliti se GPS spento
+        return info;
+    }
+    
+    // Invia comando per ottenere info GPS
+    SerialAT.println("AT+CGNSINF");
+    delay(1000);
+    
+    String response = "";
+    unsigned long start = millis();
+    
+    while (millis() - start < GPS_TIMEOUT) {
+        if (SerialAT.available()) {
+            response += SerialAT.readString();
+            if (response.indexOf("OK") >= 0) {
+                break;
+            }
+        }
+        delay(50);
+    }
+    
+    if (response.indexOf("+CGNSINF:") >= 0) {
+        int startIdx = response.indexOf("+CGNSINF: ");
+        if (startIdx >= 0) {
+            startIdx += 10;
+            int endIdx = response.indexOf("\r", startIdx);
+            if (endIdx == -1) endIdx = response.indexOf("\n", startIdx);
+            
+            String data = response.substring(startIdx, endIdx);
+            
+            String parts[20];
+            int partCount = splitString(data, ',', parts, 20);
+            
+            if (partCount >= 15) {
+                int gnssRunStatus = parts[0].toInt();
+                int fixStatus = parts[1].toInt();
+                String datetime = parts[2];
+                float latitude = parts[3].toFloat();
+                float longitude = parts[4].toFloat();
+                float altitude = parts[5].toFloat();
+                float speed = parts[6].toFloat();
+                float heading = parts[7].toFloat();
+                int satellites = parts[14].toInt();  // ✅ SEMPRE estrai satelliti
+                float hdop = parts[10].toFloat();
+                
+                // ✅ POPOLA SEMPRE I DATI BASE
+                info.latitude = latitude;
+                info.longitude = longitude;
+                info.altitude = altitude;
+                info.speed = speed;
+                info.heading = heading;
+                info.satellites = satellites;  // ✅ SEMPRE popola satelliti
+                info.hdop = hdop;
+                info.datetime = datetime;
+                info.timestamp = millis();
+                
+                // Validazione fix
+                bool validCoordinates = (latitude != 0.0 && longitude != 0.0 && 
+                                       latitude >= -90.0 && latitude <= 90.0 && 
+                                       longitude >= -180.0 && longitude <= 180.0);
+                
+                bool hasFix = (gnssRunStatus == 1 && fixStatus == 1 && satellites >= 4);
+                
+                info.isValid = (validCoordinates && hasFix);
+                
+                if (info.isValid) {
+                    status.isGPSFixed = true;
+                    Serial.printf("✅ GPS FIXED: %.6f,%.6f (Sats: %d, HDOP: %.1f)\n", 
+                                 latitude, longitude, satellites, hdop);
+                } else {
+                    status.isGPSFixed = false;
+                    
+                    // ✅ LOG MIGLIORATO: Mostra satelliti anche senza fix
+                    if (satellites > 0) {
+                        Serial.printf("⏳ GPS in attesa fix: Sats=%d, Fix=%d, Valid coords=%s\n", 
+                                     satellites, fixStatus, validCoordinates ? "SI" : "NO");
+                    } else {
+                        Serial.println("🔍 GPS in ricerca satelliti...");
+                    }
+                }
+                
+                Serial.printf("📊 GPS Status: GNSS=%d, Fix=%d, Sats=%d, Coords=%.6f,%.6f\n",
+                             gnssRunStatus, fixStatus, satellites, latitude, longitude);
+                             
+            } else {
+                Serial.printf("❌ Dati GPS insufficienti: %d parti\n", partCount);
+                status.isGPSFixed = false;
+                info.isValid = false;
+                info.satellites = 0;  // ✅ 0 satelliti se dati insufficienti
+            }
+        }
+    } else {
+        Serial.println("❌ Nessuna risposta GPS ricevuta");
+        status.isGPSFixed = false;
+        info.isValid = false;
+        info.satellites = 0;  // ✅ 0 satelliti se nessuna risposta
+    }
+    
+    return info;
+}
+
+bool parseGNSSResponse(const String& response) {
+    int start = response.indexOf("+CGNSINF: ");
+    if (start == -1) {
+        Serial.println("❌ Nessun +CGNSINF nella risposta");
+        return false;
+    }
+    
+    start += 10;
+    int end = response.indexOf("\r", start);
+    if (end == -1) end = response.indexOf("\n", start);
+    
+    String data = response.substring(start, end);
+    Serial.println("🔍 Parsing: " + data);
+    
+    String parts[20];
+    int partCount = splitString(data, ',', parts, 20);
+    
+    if (partCount >= 15) {
+        int gnssRunStatus = parts[0].toInt();
+        int fixStatus = parts[1].toInt();
+        
+        Serial.printf("🛰️ GNSS Status: %d, Fix Status: %d\n", gnssRunStatus, fixStatus);
+        
+        if (gnssRunStatus == 1 && fixStatus == 1) {
+            gpsData.isValid = true;
+            gpsData.datetime = parts[2];
+            gpsData.latitude = parts[3].toFloat();
+            gpsData.longitude = parts[4].toFloat();
+            gpsData.altitude = parts[5].toFloat();
+            gpsData.speed = parts[6].toFloat();
+            gpsData.heading = parts[7].toFloat();
+            gpsData.satellites = parts[14].toInt();
+            gpsData.hdop = parts[10].toFloat();
+            gpsData.timestamp = millis();
+            
+            Serial.printf("✅ GPS Fix: %.6f,%.6f (Sats: %d)\n", 
+                         gpsData.latitude, gpsData.longitude, gpsData.satellites);
+            return true;
+        } else {
+            Serial.printf("⏳ GPS: GNSS=%d, Fix=%d, Sats=%s\n", 
+                         gnssRunStatus, fixStatus, parts[14].c_str());
+        }
+    } else {
+        Serial.printf("❌ Dati insufficienti: %d parti\n", partCount);
+    }
+    
+    gpsData.isValid = false;
+    return false;
+}
+
+int splitString(const String& data, char separator, String* parts, int maxParts) {
+    int partCount = 0;
+    int lastIndex = 0;
+    
+    for (int i = 0; i <= data.length() && partCount < maxParts; i++) {
+        if (i == data.length() || data.charAt(i) == separator) {
+            parts[partCount] = data.substring(lastIndex, i);
+            partCount++;
+            lastIndex = i + 1;
+        }
+    }
+    
+    return partCount;
+}
+
+
+void readGPS() {
+    static uint32_t lastGPSDebug = 0;
+    static uint32_t gpsFailCount = 0;
+    static uint32_t totalGPSAttempts = 0;
+    static uint32_t gpsStartTime = 0;
+    static bool timeoutWarningShown = false;
+    static uint32_t lastForceRestart = 0;
+    
+    // Inizializza timer al primo tentativo
+    if (gpsStartTime == 0 && status.gpsEnabled) {
+        gpsStartTime = millis();
+        timeoutWarningShown = false;
+    }
+    
+    // Reset timer se GPS ottiene fix
+    if (status.isGPSFixed) {
+        gpsStartTime = 0;
+        timeoutWarningShown = false;
+        gpsFailCount = 0;
+    }
+    
+    totalGPSAttempts++;
+    
+    if (!status.gpsEnabled) {
+        gpsStartTime = 0;
+        status.isGPSFixed = false;  // Assicurati che sia false se GPS spento
+        return;
+    }
+    
+    // ✅ CHIAMATA PRINCIPALE - getGPSInfo() ora aggiorna automaticamente status.isGPSFixed
+    GPSInfo gps = getGPSInfo();
+    
+    if (gps.isValid && status.isGPSFixed) {
+        // ✅ GPS FIX SUCCESS - aggiorna i dati globali
+        gpsData = gps;
+        gpsFailCount = 0;
+        gpsStartTime = 0;
+        
+        Serial.printf("🛰️ GPS OK: %.6f,%.6f Alt:%.1fm Speed:%.1fkm/h Sats:%d\n", 
+                     gpsData.latitude, gpsData.longitude, gpsData.altitude, 
+                     gpsData.speed, gpsData.satellites);
+                     
+    } else {
+        // ✅ GPS NO FIX - status.isGPSFixed già aggiornato da getGPSInfo()
+        gpsFailCount++;
+        gpsData.isValid = false;
+        
+        uint32_t currentTime = millis();
+        
+        // Controllo timeout con restart forzato
+        if (gpsStartTime > 0) {
+            uint32_t elapsed = currentTime - gpsStartTime;
+            
+            // Warning a 2 minuti
+            if (elapsed > 120000 && !timeoutWarningShown) {
+                Serial.printf("⚠️ GPS senza fix da %lu secondi\n", elapsed/1000);
+                timeoutWarningShown = true;
+            }
+            
+            // Timeout a 10 minuti - restart GPS FORZATO
+            if (elapsed > 600000 && currentTime - lastForceRestart > 30000) {
+                Serial.printf("⏰ TIMEOUT GPS (%lu min) - RESTART FORZATO\n", elapsed/60000);
+                
+                // Restart forzato senza controlli
+                Serial.println("🔒 Spegnimento GPS forzato...");
+                sendCommand("AT+CGNSPWR=0", 3000);
+                status.gpsEnabled = false;
+                status.isGPSFixed = false;
+                gpsData.isValid = false;
+                delay(5000);
+                
+                Serial.println("🛰️ Riattivazione GPS forzata...");
+                if (sendCommand("AT+CGNSPWR=1", 10000)) {
+                    status.gpsEnabled = true;
+                    Serial.println("✅ GPS riattivato forzatamente");
+                } else {
+                    Serial.println("❌ Errore riattivazione GPS");
+                    status.errorCount += 2;  // Incrementa error count
+                }
+                
+                gpsStartTime = currentTime;
+                gpsFailCount = 0;
+                timeoutWarningShown = false;
+                lastForceRestart = currentTime;
+            }
+        }
+        
+        // Debug periodico
+        bool showDebug = (currentTime - lastGPSDebug > 30000);
+        if (showDebug) {
+            Serial.printf("⏳ GPS in attesa fix (tentativi: %d, elapsed: %lu s)\n", 
+                         gpsFailCount, gpsStartTime > 0 ? (currentTime - gpsStartTime)/1000 : 0);
+            lastGPSDebug = currentTime;
+        }
+    }
+}
+
+void handleStateMachine() {
+    switch (status.state) {
+        case STATE_INIT:
+            Serial.println("🔄 State: INIT");
+            status.state = STATE_READY;
+            break;
+            
+        case STATE_READY:
+            if (status.networkState == NET_DISCONNECTED) {
+                Serial.println("🔄 State: READY -> Avvio connessione rete");
+                status.state = STATE_NETWORK_CONNECTING;
+            } else if (!status.isGPSFixed) {
+                status.state = STATE_GPS_ACQUIRING;
+            } else {
+                status.state = STATE_ONLINE;
+            }
+            break;
+            
+        case STATE_GPS_ACQUIRING:
+            if (status.isGPSFixed) {
+                Serial.println("🔄 State: GPS_ACQUIRING -> ONLINE");
+                status.state = STATE_ONLINE;
+            }
+            break;
+            
+        case STATE_NETWORK_CONNECTING:
+            break;
+            
+        case STATE_ONLINE:
+            if (status.networkState != NET_CONNECTED) {
+                Serial.println("🔄 State: ONLINE -> NETWORK_CONNECTING");
+                status.state = STATE_NETWORK_CONNECTING;
+            }
+            break;
+            
+        case STATE_ERROR:
+            Serial.println("🔄 State: ERROR -> Tentativo recovery");
+            delay(5000);
+            status.connectionRetries = 0;
+            status.httpInProgress = false;
+            status.registrationState = REG_NOT_STARTED;
+            status.state = STATE_READY;
+            break;
+            
+        case STATE_SLEEP_PREP:
+            Serial.println("🔄 State: SLEEP_PREP");
+            enterSleepMode();
+            break;
+        case STATE_SLEEP:
+            break;
+    }
+}
+
+void handleNetworkOperations() {
+    static uint32_t lastNetworkCheck = 0;
+    uint32_t currentTime = millis();
+    
+    if (currentTime - lastNetworkCheck < 5000) return;
+    lastNetworkCheck = currentTime;
+    
+    switch (status.networkState) {
+        case NET_DISCONNECTED:
+            if (status.state == STATE_NETWORK_CONNECTING) {
+                Serial.println("🌐 Tentativo connessione rete...");
+                if (connectToNetwork()) {
+                    status.networkState = NET_CONNECTED;
+                    status.connectionRetries = 0;
+                    status.state = STATE_GPS_ACQUIRING;
+                    delay(2000);
+                } else {
+                    status.connectionRetries++;
+                    if (status.connectionRetries >= config.maxRetries) {
+                        status.networkState = NET_ERROR;
+                        status.state = STATE_ERROR;
+                    }
+                }
+            }
+            break;
+            
+        case NET_CONNECTING:
+            break;
+            
+        case NET_CONNECTED:
+            if (!modem.isNetworkConnected() || !modem.isGprsConnected()) {
+                Serial.println("❌ Connessione di rete o GPRS persa");
+                status.networkState = NET_DISCONNECTED;
+                status.state = STATE_NETWORK_CONNECTING;
+                status.httpInProgress = false;
+                status.registrationState = REG_NOT_STARTED;
+                
+                if (http.connected()) {
+                    http.stop();
+                }
+            } else {
+                handleDeviceRegistrationFlow();
+            }
+            break;
+            
+        case NET_ERROR:
+            if (currentTime - lastNetworkCheck >= NETWORK_RETRY_DELAY) {
+                Serial.println("🔄 Retry connessione dopo errore");
+                status.networkState = NET_DISCONNECTED;
+                status.connectionRetries = 0;
+                status.httpInProgress = false;
+                status.registrationState = REG_NOT_STARTED;
+                
+                if (http.connected()) {
+                    http.stop();
+                }
+            }
+            break;
+    }
+}
+
+void handleDeviceRegistrationFlow() {
+    if (status.httpInProgress) return;
+    
+    static uint32_t lastRegistrationAttempt = 0;
+    uint32_t currentTime = millis();
+    
+    // Rate limiting per tentativi di registrazione
+    if (currentTime - lastRegistrationAttempt < 30000 && 
+        status.registrationState != REG_NOT_STARTED) {
+        return;
+    }
+    
+    switch (status.registrationState) {
+        case REG_NOT_STARTED:
+            Serial.println("🔍 Inizio verifica esistenza device...");
+            if (checkDeviceExists()) {
+                Serial.println("✅ Device già registrato");
+                status.registrationState = REG_COMPLETED;
+            } else {
+                Serial.println("📝 Device non trovato, avvio registrazione...");
+                status.registrationState = REG_REGISTERING;
+            }
+            lastRegistrationAttempt = currentTime;
+            break;            
+        case REG_REGISTERING:
+            Serial.println("📝 Registrazione device in corso...");
+            if (registerDevice()) {
+                Serial.println("✅ Device registrato con successo");
+                status.registrationState = REG_COMPLETED;
+            } else {
+                Serial.println("❌ Errore registrazione device");
+                status.registrationState = REG_ERROR;
+            }
+            lastRegistrationAttempt = currentTime;
+            break;
+            
+        case REG_COMPLETED:
+            // Device registrato - operazioni normali
+            handleNormalOperations(currentTime);
+            break;
+            
+        case REG_ERROR:
+            Serial.println("❌ Errore registrazione - nuovo tentativo tra 30s");
+            if (currentTime - lastRegistrationAttempt >= 30000) {
+                status.registrationState = REG_NOT_STARTED;
+            }
+            break;
+            
+        default:
+            Serial.printf("❌ Stato registrazione non valido: %d\n", status.registrationState);
+            status.registrationState = REG_NOT_STARTED;
+            break;
+    }
+}
+
+void handleNormalOperations(uint32_t currentTime) {
+    // Heartbeat ogni 30 secondi gestito nel loop principale
+    
+    // Debug periodico stato
+    static uint32_t lastOperationDebug = 0;
+    if (currentTime - lastOperationDebug >= 120000) { // Ogni 2 minuti
+        Serial.printf("✅ Operazioni normali - Heartbeat ogni %ds, GPS: %s\n", 
+                     config.heartbeatInterval / 1000,
+                     status.gpsEnabled ? "ATTIVO" : "SPENTO");
+        lastOperationDebug = currentTime;
+    }
+}
+
+void printRegistrationStatus() {
+    Serial.printf("📊 === STATUS REPORT ===\n");
+    Serial.printf("  🔧 SystemState: %d\n", status.state);
+    Serial.printf("  🌐 NetworkState: %d\n", status.networkState);
+    Serial.printf("  📝 RegistrationState: %d\n", status.registrationState);
+    Serial.printf("  📶 Network Connected: %s\n", modem.isNetworkConnected() ? "SI" : "NO");
+    Serial.printf("  📱 GPRS Connected: %s\n", modem.isGprsConnected() ? "SI" : "NO");
+    Serial.printf("  🛰️ GPS Enabled: %s\n", status.gpsEnabled ? "SI" : "NO");
+    Serial.printf("  📍 GPS Fixed: %s\n", status.isGPSFixed ? "SI" : "NO");
+    Serial.printf("  🚨 Lost Mode: %s\n", status.lostModeEnabled ? "SI" : "NO");
+    Serial.printf("  📍 Single Location: %s\n", status.sendSingleLocation ? "SI" : "NO");
+    Serial.printf("  🔋 Battery: %.1f%%\n", status.batteryLevel);
+    Serial.printf("  📶 Signal: %d/31\n", status.signalQuality);
+    Serial.printf("  ⏱️ Uptime: %lu s\n", status.uptime / 1000);
+    Serial.printf("  🌐 HTTP in Progress: %s\n", status.httpInProgress ? "SI" : "NO");
+    Serial.println("======================");
+}
+
+// API INTEGRATION FUNCTIONS - Conformi alla documentazione
+
+bool checkDeviceExists() {
+    String url = "/api/ping"; // Test di connettività prima
+    String response;
+    
+    if (!makeHttpRequest("GET", url, "", response)) {
+        Serial.println("❌ Test connettività fallito");
+        return false;
+    }
+    
+    Serial.println("✅ Connettività server OK");
+    
+    // Ora verifica esistenza device
+    url = "/api/device/" + config.deviceId + "/exists";
+    
+    if (makeHttpRequest("GET", url, "", response)) {
+        StaticJsonDocument<128> doc;
+        if (deserializeJson(doc, response) == DeserializationError::Ok) {
+            bool exists = doc["exists"] | false;
+            return exists;
+        }
+    }
+    
+    return false; // Default: considera device non esistente
+}
+
+bool registerDevice() {
+    String url = "/api/device/register";
+    
+    StaticJsonDocument<512> doc;
+    doc["deviceId"] = config.deviceId;
+    doc["deviceName"] = config.deviceName;
+    doc["deviceType"] = "GPS_TRACKER";
+    doc["firmwareVersion"] = config.firmwareVersion;
+    doc["hardwareVersion"] = config.hardwareVersion;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    Serial.println("📤 Registrazione device:");
+    Serial.println(payload);
+    
+    String response;
+    if (sendWithRetry("POST", url, payload, response)) {
+        Serial.println("📥 Risposta registrazione:");
+        Serial.println(response);
+        
+        StaticJsonDocument<512> responseDoc;
+        if (deserializeJson(responseDoc, response) == DeserializationError::Ok) {
+            status.deviceUUID = responseDoc["id"] | "";
+            
+            // Carica configurazione ricevuta dal server
+            if (responseDoc.containsKey("config")) {
+                JsonObject configObj = responseDoc["config"];
+                config.heartbeatInterval = configObj["heartbeatInterval"] | config.heartbeatInterval;
+                config.gpsReadInterval = configObj["gpsReadInterval"] | config.gpsReadInterval;
+                config.lostModeInterval = configObj["lostModeInterval"] | config.lostModeInterval;
+                config.lowBatteryThreshold = configObj["lowBatteryThreshold"] | config.lowBatteryThreshold;
+                
+                saveConfigToNVS();
+                Serial.println("✅ Configurazione aggiornata dal server");
+            }
+            
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+void sendHeartbeatAndCheckCommands() {
+    if (status.httpInProgress || status.registrationState != REG_COMPLETED) return;
+    
+    String url = "/api/device/" + config.deviceId + "/heartbeat";
+    
+    StaticJsonDocument<768> doc;
+    
+    // === STATUS DISPOSITIVO BASE ===
+    String deviceStatus = "online";
+    doc["status"] = deviceStatus;
+    doc["batteryLevel"] = String(status.batteryLevel, 1);
+    doc["uptime"] = millis() / 1000;
+    doc["errorCount"] = status.errorCount;
+    doc["firmwareVersion"] = config.firmwareVersion;
+    
+    // === RETE ===
+    JsonObject network = doc.createNestedObject("network");
+    int csq = modem.getSignalQuality();
+    network["signalQuality"] = getSignalQuality();
+    network["csqRaw"] = csq;
+    network["operator"] = modem.getOperator();
+    network["networkType"] = getNetworkType();
+    network["isConnected"] = modem.isNetworkConnected();
+    network["isGprsConnected"] = modem.isGprsConnected();
+    network["localIP"] = modem.getLocalIP();
+    
+    // === GPS CORRETTO ===
+    JsonObject gps = doc.createNestedObject("gps");
+    
+    // Status GPS principale
+    gps["enabled"] = status.gpsEnabled;
+    gps["fixed"] = status.isGPSFixed;
+    gps["dataValid"] = gpsData.isValid;
+    
+    // ✅ CORREZIONE: Solo invia dati GPS se GPS è abilitato
+    if (status.gpsEnabled) {
+        // ✅ Se GPS ha fix valido, invia tutti i dati
+        if (status.isGPSFixed && gpsData.isValid) {
+            gps["satellites"] = gpsData.satellites;
+            gps["hdop"] = String(gpsData.hdop, 2);
+            gps["latitude"] = String(gpsData.latitude, 6);
+            gps["longitude"] = String(gpsData.longitude, 6);
+            gps["altitude"] = String(gpsData.altitude, 1);
+            gps["speed"] = String(gpsData.speed, 1);
+            gps["heading"] = String(gpsData.heading, 1);
+            gps["lastFixAge"] = (millis() - gpsData.timestamp) / 1000;
+        } else {
+            // ✅ GPS acceso ma senza fix - fai una lettura fresca per i satelliti
+            GPSInfo currentGPS = getGPSInfo();
+            
+            // Invia il numero di satelliti ATTUALE (anche senza fix)
+            gps["satellites"] = currentGPS.satellites;
+            gps["hdop"] = String(currentGPS.hdop, 2);
+            gps["lastFixAge"] = -1; // Indica nessun fix
+            
+            // ✅ DEBUG: Log per verificare
+            Serial.printf("📡 Heartbeat GPS senza fix: Sats=%d, HDOP=%.1f\n", 
+                         currentGPS.satellites, currentGPS.hdop);
+        }
+        
+        // Status hardware GPS
+        gps["hardwareStatus"] = getGPSHardwareStatus();
+        gps["lastReadAttempt"] = (millis() - status.lastGPSRead) / 1000;
+    } else {
+        // ✅ GPS spento - valori di default
+        gps["satellites"] = 0;
+        gps["hdop"] = 99.9;
+        gps["lastFixAge"] = -1;
+        gps["hardwareStatus"] = "powered_off";
+    }
+    
+    // Modalità GPS attive
+    gps["lostModeActive"] = status.lostModeEnabled;
+    gps["geofenceActive"] = status.geofencingEnabled;
+    gps["singleLocationPending"] = status.sendSingleLocation;
+    
+    // === CONFIGURATION SNAPSHOT ===
+    JsonObject cfg = doc.createNestedObject("config");
+    cfg["heartbeatInterval"] = config.heartbeatInterval;
+    cfg["gpsReadInterval"] = config.gpsReadInterval;
+    cfg["lostModeInterval"] = config.lostModeInterval;
+    cfg["lowBatteryThreshold"] = config.lowBatteryThreshold;
+    
+    // === SISTEMA ===
+    JsonObject system = doc.createNestedObject("system");
+    system["freeHeap"] = ESP.getFreeHeap();
+    system["totalHeap"] = ESP.getHeapSize();
+    system["heapUsage"] = 100 - ((ESP.getFreeHeap() * 100) / ESP.getHeapSize());
+    system["cpuFreq"] = ESP.getCpuFreqMHz();
+    system["flashSize"] = ESP.getFlashChipSize();
+    
+    doc["timestamp"] = getFormattedTimestamp();
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    // Debug log migliorato
+    Serial.printf("💓 Heartbeat: %s | Battery: %.1f%% | Signal: %d/5 (%d CSQ) | GPS: %s (%d sats) | Heap: %.1f%%\n", 
+                 deviceStatus.c_str(), 
+                 status.batteryLevel, 
+                 getSignalQuality(), 
+                 csq,
+                 status.isGPSFixed ? "FIX" : "NO-FIX",
+                 status.gpsEnabled ? (status.isGPSFixed ? gpsData.satellites : getGPSInfo().satellites) : 0,
+                 100.0 - ((ESP.getFreeHeap() * 100.0) / ESP.getHeapSize()));
+    
+    String response;
+    if (sendWithRetry("POST", url, payload, response)) {
+        Serial.println("✅ Heartbeat esteso inviato con successo");
+        status.errorCount = 0;
+        if (response.indexOf("\"action\":\"reboot\"") >= 0 || 
+            response.indexOf("device_not_registered") >= 0) {
+            Serial.println("🔄 Server richiede REBOOT - dispositivo non registrato");
+            Serial.println("📋 Risposta server: " + response);
+            
+            // Delay per permettere al server di ricevere la conferma
+            delay(2000);
+            
+            Serial.println("🔄 REBOOT per re-registrazione...");
+            ESP.restart();
+            return;
+        }
+        
+        // Processa risposta normale per comandi e configurazione
+        StaticJsonDocument<1024> responseDoc;
+        if (deserializeJson(responseDoc, response) == DeserializationError::Ok) {
+            
+            // Controlla anche array comandi per reboot
+            if (responseDoc.containsKey("commands") && responseDoc["commands"].is<JsonArray>()) {
+                JsonArray commands = responseDoc["commands"];
+                
+                // ✅ NUOVO: Priorità assoluta per comando reboot
+                for (JsonObject cmdObj : commands) {
+                    String commandType = cmdObj["commandType"] | "";
+                    if (commandType == "reboot") {
+                        String reason = "";
+                        if (cmdObj.containsKey("commandData")) {
+                            JsonObject cmdData = cmdObj["commandData"];
+                            reason = cmdData["reason"] | "unknown";
+                        }
+                        
+                        Serial.printf("🔄 COMANDO REBOOT ricevuto - Motivo: %s\n", reason.c_str());
+                        delay(3000); // Attendi per permettere debug
+                        ESP.restart();
+                        return;
+                    }
+                }
+                
+                // Processa altri comandi normalmente
+                if (commands.size() > 0) {
+                    Serial.printf("📨 Ricevuti %d comandi dal server\n", commands.size());
+                    processServerCommands(commands);
+                }
+            }
+            
+            // Aggiorna configurazione se presente
+            if (responseDoc.containsKey("config")) {
+                JsonObject configObj = responseDoc["config"];
+                uint32_t newHeartbeatInterval = configObj["heartbeatInterval"] | config.heartbeatInterval;
+                
+                if (newHeartbeatInterval != config.heartbeatInterval) {
+                    config.heartbeatInterval = newHeartbeatInterval;
+                    saveConfigToNVS();
+                    Serial.printf("🔧 Heartbeat interval aggiornato: %d ms\n", config.heartbeatInterval);
+                }
+            }
+        }
+        
+        status.errorCount = 0; // Reset error count on successful heartbeat
+    } else {
+        Serial.println("❌ Errore invio heartbeat esteso");
+        status.errorCount++;
+    }
+}
+
+
+String getNetworkType() {
+    // Determina tipo di rete (2G/3G/4G) basato sul modem
+    String operator_info = modem.getOperator();
+    
+    // Il SIM7000G supporta principalmente LTE Cat-M1 e NB-IoT
+    if (modem.isNetworkConnected()) {
+        // Prova a determinare il tipo di rete via AT command
+        SerialAT.println("AT+COPS?");
+        delay(1000);
+        if (SerialAT.available()) {
+            String response = SerialAT.readString();
+            if (response.indexOf("LTE") >= 0 || response.indexOf("4G") >= 0) {
+                return "4G-LTE";
+            } else if (response.indexOf("3G") >= 0 || response.indexOf("UMTS") >= 0) {
+                return "3G";
+            } else if (response.indexOf("2G") >= 0 || response.indexOf("GSM") >= 0) {
+                return "2G";
+            }
+        }
+        return "LTE-M";  // Default per SIM7000G
+    }
+    return "disconnected";
+}
+
+String getNetworkStateString() {
+    switch (status.networkState) {
+        case NET_DISCONNECTED: return "disconnected";
+        case NET_CONNECTING: return "connecting";
+        case NET_CONNECTED: return "connected";
+        case NET_ERROR: return "error";
+        default: return "unknown";
+    }
+}
+
+String getGPSHardwareStatus() {
+    // Verifica status hardware GPS via AT command
+    SerialAT.println("AT+CGNSPWR?");
+    delay(500);
+    
+    if (SerialAT.available()) {
+        String response = SerialAT.readString();
+        if (response.indexOf("+CGNSPWR: 1") >= 0) {
+            return "powered_on";
+        } else if (response.indexOf("+CGNSPWR: 0") >= 0) {
+            return "powered_off";
+        }
+    }
+    return "unknown";
+}
+
+String getFormattedTimestamp() {
+    // Prova a ottenere timestamp dalla rete se disponibile
+    if (modem.isNetworkConnected()) {
+        SerialAT.println("AT+CCLK?");
+        delay(1000);
+        if (SerialAT.available()) {
+            String response = SerialAT.readString();
+            int start = response.indexOf("+CCLK: \"");
+            if (start >= 0) {
+                start += 8;
+                int end = response.indexOf("\"", start);
+                if (end > start) {
+                    return response.substring(start, end);
+                }
+            }
+        }
+    }
+    
+    // Fallback: timestamp basato su millis
+    return String(millis() / 1000);
+}
+
+void processServerCommands(JsonArray commands) {
+    for (JsonObject cmdObj : commands) {
+        ServerCommand cmd;
+        cmd.id = cmdObj["id"] | "";
+        cmd.commandType = cmdObj["commandType"] | "";
+        cmd.commandData = cmdObj["commandData"] | "";
+        cmd.status = cmdObj["status"] | "";
+        cmd.createdAt = cmdObj["createdAt"] | "";
+        
+        if (cmd.id.length() > 0 && cmd.commandType.length() > 0) {
+            Serial.printf("🎯 Esecuzione comando: %s (ID: %s)\n", cmd.commandType.c_str(), cmd.id.c_str());
+            executeCommand(cmd);
+        }
+    }
+}
+
+void executeCommand(const ServerCommand& cmd) {
+    String result = "unknown_command";
+    String cmdStatus = "completed";
+    
+    Serial.printf("🎯 Esecuzione comando: %s (ID: %s)\n", cmd.commandType.c_str(), cmd.id.c_str());
+    
+    if (cmd.commandType == "enable_geofence_monitoring") {
+        // ✅ NON PARSING INTERVAL - USA CONFIG ESISTENTE
+        Serial.println("🌍 Attivazione geofence monitoring...");
+        
+        // Verifica che gpsReadInterval sia configurato
+        if (config.gpsReadInterval == 0) {
+            Serial.println("⚠️ gpsReadInterval non configurato - uso default 30s");
+            config.gpsReadInterval = 30000; // Default 30 secondi
+            saveConfigToNVS();
+        }
+        
+        // ✅ ATTIVA FLAG E GPS
+        status.geofencingEnabled = true;
+        prefs.putBool("geofencing", true);
+        
+        if (enableGPS()) {
+            result = "geofence_monitoring_enabled";
+            Serial.printf("🌍 Geofence monitoring attivato: GPS ogni %d ms\n", 
+                         config.gpsReadInterval);
+        } else {
+            status.geofencingEnabled = false;
+            prefs.putBool("geofencing", false);
+            cmdStatus = "failed";
+            result = "gps_activation_failed";
+            Serial.println("❌ Errore attivazione GPS per geofencing");
+        }
+        
+    } else if (cmd.commandType == "disable_geofence_monitoring") {
+        // ✅ DISATTIVA FLAG
+        Serial.println("🌍 Disattivazione geofence monitoring...");
+        
+        status.geofencingEnabled = false;
+        prefs.putBool("geofencing", false);
+        
+        // Controlla se spegnere GPS (considera tutti i flag)
+        disableGPS();
+        
+        result = "geofence_monitoring_disabled";
+        Serial.println("✅ Geofence monitoring disattivato");
+        
+    } else  if (cmd.commandType == "update_config") {
+        // Parsing configurazione dal commandData (JSON)
+        StaticJsonDocument<512> configDoc;
+        if (deserializeJson(configDoc, cmd.commandData) == DeserializationError::Ok) {
+            
+            Serial.println("📝 Aggiornamento configurazione ricevuto:");
+            
+            // ✅ 1. HEARTBEAT INTERVAL - Quanto spesso "telefona a casa"
+            if (configDoc.containsKey("heartbeatInterval")) {
+                uint32_t newInterval = configDoc["heartbeatInterval"];
+                if (newInterval >= 30000 && newInterval <= 3600000) { // 30s - 1h
+                    config.heartbeatInterval = newInterval;
+                    Serial.printf("💓 Heartbeat interval: %d ms (%d secondi)\n", 
+                                 config.heartbeatInterval, config.heartbeatInterval/1000);
+                } else {
+                    Serial.printf("⚠️ Heartbeat interval fuori range: %d ms\n", newInterval);
+                }
+            }
+            
+            // ✅ 2. LOST MODE INTERVAL - GPS quando smarrito
+            if (configDoc.containsKey("lostModeInterval")) {
+                uint32_t newInterval = configDoc["lostModeInterval"];
+                if (newInterval >= 5000 && newInterval <= 60000) { // 5s - 60s
+                    config.lostModeInterval = newInterval;
+                    Serial.printf("🚨 Lost mode interval: %d ms (%d secondi)\n", 
+                                 config.lostModeInterval, config.lostModeInterval/1000);
+                } else {
+                    Serial.printf("⚠️ Lost mode interval fuori range: %d ms\n", newInterval);
+                }
+            }
+            
+            // ✅ 3. GEOFENCE GPS INTERVAL - GPS per geofencing (SOLO AGGIORNAMENTO VALORE)
+            if (configDoc.containsKey("gpsReadInterval")) {
+                uint32_t newInterval = configDoc["gpsReadInterval"];
+                if (newInterval >= 0 && newInterval <= 300000) { // 0s - 5min
+                    config.gpsReadInterval = newInterval;
+                    Serial.printf("🌍 Geofence GPS interval aggiornato: %d ms (%d secondi)\n", 
+                                 config.gpsReadInterval, config.gpsReadInterval/1000);
+                    // Il GPS viene gestito solo dai comandi enable/disable_geofence_monitoring
+                } else {
+                    Serial.printf("⚠️ GPS read interval fuori range: %d ms\n", newInterval);
+                }
+            }
+            
+            // ✅ 4. LOW BATTERY THRESHOLD - Soglia batteria bassa
+            if (configDoc.containsKey("lowBatteryThreshold")) {
+                float newThreshold = configDoc["lowBatteryThreshold"];
+                if (newThreshold >= 5.0 && newThreshold <= 50.0) { // 5% - 50%
+                    config.lowBatteryThreshold = newThreshold;
+                    Serial.printf("🔋 Soglia batteria bassa: %.1f%%\n", config.lowBatteryThreshold);
+                } else {
+                    Serial.printf("⚠️ Soglia batteria fuori range: %.1f%%\n", newThreshold);
+                }
+            }
+            
+            // Salva configurazione aggiornata in NVS
+            saveConfigToNVS();
+            result = "config_updated";
+            
+            Serial.println("✅ Configurazione aggiornata e salvata");
+            
+        } else {
+            cmdStatus = "failed";
+            result = "invalid_config_json";
+            Serial.println("❌ Errore parsing JSON configurazione");
+        }
+        
+    } else if (cmd.commandType == "get_location") {
+        // Richiesta posizione immediata
+        status.sendSingleLocation = true;
+        if (enableGPS()) {
+            result = "location_request_queued";
+            Serial.println("📍 Richiesta posizione GPS in coda");
+        } else {
+            result = "gps_activation_failed";
+            cmdStatus = "failed";
+        }
+        
+    } else if (cmd.commandType == "enable_lost_mode") {
+        status.lostModeEnabled = true;
+        prefs.putBool("lost_mode", true);
+        
+        if (enableGPS()) {
+            result = "lost_mode_enabled";
+            Serial.printf("🚨 Modalità smarrimento attivata (GPS ogni %d ms)\n", config.lostModeInterval);
+        } else {
+            result = "lost_mode_enabled_no_gps";
+            Serial.println("🚨 Modalità smarrimento attivata (GPS non disponibile)");
+        }
+        
+    } else if (cmd.commandType == "disable_lost_mode") {
+        status.lostModeEnabled = false;
+        prefs.putBool("lost_mode", false);
+        
+        // Controlla se spegnere GPS (considera tutti i flag)
+        disableGPS();
+        
+        result = "lost_mode_disabled";
+        Serial.println("✅ Modalità smarrimento disattivata");
+        
+    } else {
+        cmdStatus = "failed";
+        result = "unsupported_command";
+        Serial.printf("❌ Comando non supportato: %s\n", cmd.commandType.c_str());
+    }
+    
+    // Acknowledge command
+    if (cmd.commandType != "reboot") {
+        acknowledgeCommand(cmd.id, cmdStatus, result);
+    }
+}
+
+void acknowledgeCommand(const String& commandId, const String& cmdStatus, const String& result) {
+    if (status.httpInProgress) return;  // ⚠️ Ora 'status' è la struct corretta
+    
+    String url = "/api/device/" + config.deviceId + "/commands/" + commandId + "/ack";
+    
+    StaticJsonDocument<200> doc;
+    doc["status"] = cmdStatus;  // ⚠️ Usa il parametro rinominato
+    doc["result"] = result;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    String response;
+    if (makeHttpRequest("POST", url, payload, response)) {
+        Serial.printf("✅ Comando confermato: %s -> %s\n", cmdStatus.c_str(), result.c_str());
+    } else {
+        Serial.printf("❌ Errore conferma comando: %s\n", commandId.c_str());
+    }
+}
+
+
+void sendLocationUpdate() {
+    if (status.networkState != NET_CONNECTED || status.httpInProgress || 
+        status.registrationState != REG_COMPLETED) return;
+    if (!status.isGPSFixed || !gpsData.isValid) return;
+    
+    String url = "/api/device/" + config.deviceId + "/location";
+    
+    StaticJsonDocument<512> doc;
+    doc["latitude"] = String(gpsData.latitude, 6);
+    doc["longitude"] = String(gpsData.longitude, 6);
+    doc["altitude"] = String(gpsData.altitude, 1);
+    doc["speed"] = String(gpsData.speed, 1);
+    doc["heading"] = String(gpsData.heading, 1);
+    doc["satellites"] = gpsData.satellites;
+    doc["hdop"] = String(gpsData.hdop, 1);
+    doc["batteryLevel"] = String(status.batteryLevel, 1);
+    doc["signalQuality"] = getSignalQuality();
+    doc["networkOperator"] = modem.getOperator();
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    String response;
+    if (sendWithRetry("POST", url, payload, response)) {
+        Serial.printf("📍 Posizione inviata: %.6f,%.6f (Sats: %d, HDOP: %.1f)\n", 
+                     gpsData.latitude, gpsData.longitude, gpsData.satellites, gpsData.hdop);
+        status.errorCount = 0;
+    } else {
+        // ✅ NUOVO: Controlla se errore è dovuto a device non trovato
+        if (response.indexOf("\"action\":\"reboot\"") >= 0 || 
+            response.indexOf("device_not_registered") >= 0) {
+            Serial.println("🔄 Posizione rifiutata - device non registrato");
+            Serial.println("📋 Risposta server: " + response);
+            
+            delay(2000);
+            Serial.println("🔄 REBOOT per re-registrazione...");
+            ESP.restart();
+            return;
+        }
+        
+        Serial.println("❌ Errore invio posizione");
+        status.errorCount++;
+    }
+}
+
+void enableLostMode() {
+    if (!enableGPS()) {
+        Serial.println("❌ Errore attivazione GPS per lost mode");
+        return;
+    }
+    
+    status.lostModeEnabled = true;
+    Serial.println("🚨 === MODALITÀ SMARRITO ATTIVATA ===");
+    Serial.printf("📍 GPS ogni %d secondi\n", config.lostModeInterval / 1000);
+    
+    prefs.putBool("lost_mode", true);
+    
+    // Segnalazione LED
+    for (int i = 0; i < 8; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(100);
+        digitalWrite(LED_PIN, LOW);
+        delay(100);
+    }
+    
+    // Reset timer GPS per iniziare subito
+    status.lastGPSRead = 0;
+}
+
+void disableLostMode() {
+    status.lostModeEnabled = false;
+    Serial.println("✅ === MODALITÀ SMARRITO DISATTIVATA ===");
+    
+    // Spegni GPS quando disattivi lost mode
+    disableGPS();
+    
+    prefs.putBool("lost_mode", false);
+    
+    // Segnalazione LED
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(500);
+        digitalWrite(LED_PIN, LOW);
+        delay(300);
+    }
+}
+
+// UTILITY E SUPPORTO FUNCTIONS
+
+int getSignalQuality() {
+    int csq = modem.getSignalQuality();
+    
+    // Converti CSQ (0-31, 99) in scala 1-5
+    if (csq == 99 || csq == 0) return 1;      // Nessun segnale
+    if (csq <= 6) return 2;                   // Segnale debole
+    if (csq <= 14) return 3;                  // Segnale medio
+    if (csq <= 22) return 4;                  // Segnale buono
+    return 5;                                 // Segnale eccellente
+}
+
+bool sendWithRetry(const String& method, const String& url, const String& payload, String& response, int maxRetries) {
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        Serial.printf("🔄 Tentativo %d/%d: %s %s\n", attempt, maxRetries, method.c_str(), url.c_str());
+        
+        if (makeHttpRequest(method, url, payload, response)) {
+            return true;
+        }
+        
+        // Errori 4xx non devono essere ritentati
+        if (response.indexOf("400") >= 0 || response.indexOf("404") >= 0 || response.indexOf("409") >= 0) {
+            Serial.printf("❌ Errore permanente HTTP - non riprovare\n");
+            return false;
+        }
+        
+        if (attempt < maxRetries) {
+            uint32_t delay_ms = 5000 * attempt; // Backoff esponenziale
+            Serial.printf("⏳ Attendo %d ms prima del prossimo tentativo...\n", delay_ms);
+            delay(delay_ms);
+        }
+    }
+    
+    Serial.printf("❌ Fallimento dopo %d tentativi\n", maxRetries);
+    return false;
+}
+
+bool makeHttpRequest(const String& method, const String& url, const String& payload, String& response) {
+    if (status.httpInProgress) {
+        Serial.println("❌ HTTP request già in corso");
+        return false;
+    }
+    
+    status.httpInProgress = true;
+    bool success = false;
+    
+    String path = url;
+    
+    Serial.printf("🌐 %s HTTP a http://%s:%d%s\n", 
+                  method.c_str(), 
+                  config.serverURL.c_str(), 
+                  config.serverPort, 
+                  path.c_str());
+    
+    if (payload.length() > 0) {
+        Serial.printf("📤 Payload: %s\n", payload.c_str());
+    }
+    
+    http.setTimeout(MAX_HTTP_TIMEOUT);
+    
+    int statusCode = -1;
+    
+    try {
+        if (method == "GET") {
+            statusCode = http.get(path);
+        } else if (method == "POST") {
+            statusCode = http.post(path, "application/json", payload);
+        } else if (method == "PUT") {
+            statusCode = http.put(path, "application/json", payload);
+        } else if (method == "DELETE") {
+            statusCode = http.del(path);
+        }
+        
+        if (statusCode == 0) {
+            statusCode = http.responseStatusCode();
+        }
+        
+        Serial.printf("📊 HTTP Status: %d\n", statusCode);
+        
+        if (statusCode > 0) {
+            response = http.responseBody();
+            Serial.printf("📄 Response (%d bytes): %s\n", response.length(), 
+                         response.length() > 200 ? (response.substring(0, 200) + "...").c_str() : response.c_str());
+            
+            // ✅ NUOVO: Gestisci risposta reboot anche su status 200
+            if ((statusCode >= 200 && statusCode < 300)) {
+                success = true;
+                
+                // Controlla se il server richiede reboot in risposta 200
+                if (response.indexOf("\"action\":\"reboot\"") >= 0 || 
+                    response.indexOf("device_not_registered") >= 0) {
+                    Serial.println("🔄 Server richiede reboot (HTTP 200)");
+                    // Non fare restart qui, lascia che la funzione chiamante gestisca
+                }
+            } else {
+                Serial.printf("❌ HTTP Error Status: %d\n", statusCode);
+            }
+        } else {
+            Serial.printf("❌ HTTP request failed with error: %d\n", statusCode);
+        }
+    } catch (...) {
+        Serial.println("❌ HTTP exception occurred");
+    }
+    
+    http.stop();
+    status.httpInProgress = false;
+    delay(1000); // Rate limiting
+    
+    return success;
+}
+
+bool connectToNetwork() {
+    Serial.println("🔌 Connessione alla rete mobile...");
+    status.networkState = NET_CONNECTING;
+    
+    // Forza modalità LTE Cat-M1/NB-IoT
+    modem.sendAT(GF("+CMNB=1"));
+    modem.waitResponse(3000);
+    delay(1000);
+    
+    Serial.print("📡 Registrazione rete");
+    int attempts = 0;
+    const int maxAttempts = 30;
+    
+    while (!modem.isNetworkConnected() && attempts < maxAttempts) {
+        Serial.print(".");
+        delay(3000);
+        attempts++;
+        
+        if (attempts % 10 == 0) {
+            Serial.printf("\n🔄 Tentativo %d/%d\n", attempts, maxAttempts);
+            
+            // Riprova con operator selection automatica
+            if (attempts == 20) {
+                Serial.println("🔄 Tentativo selezione automatica operatore...");
+                modem.sendAT(GF("+COPS=0"));
+                modem.waitResponse(10000);
+            }
+        }
+    }
+    
+    if (!modem.isNetworkConnected()) {
+        Serial.println("\n❌ ERRORE: Timeout registrazione rete");
+        status.errorCount++;
+        return false;
+    }
+    
+    Serial.println("\n🌐 Configurazione GPRS...");
+    int gprsAttempts = 0;
+    const int maxGprsAttempts = 3;
+    
+    while (gprsAttempts < maxGprsAttempts) {
+        Serial.printf("🔄 Tentativo GPRS %d/%d con APN: %s\n", 
+                     gprsAttempts + 1, maxGprsAttempts, config.apn.c_str());
+        
+        if (modem.gprsConnect(config.apn.c_str(), config.apnUser.c_str(), config.apnPass.c_str())) {
+            Serial.println("✅ GPRS connesso!");
+            break;
+        } else {
+            gprsAttempts++;
+            if (gprsAttempts < maxGprsAttempts) {
+                delay(5000);
+            }
+        }
+    }
+    
+    if (gprsAttempts >= maxGprsAttempts) {
+        Serial.println("❌ ERRORE: Connessione GPRS fallita dopo tutti i tentativi");
+        status.errorCount++;
+        return false;
+    }
+    
+    delay(2000);
+    
+    if (!modem.isGprsConnected()) {
+        Serial.println("❌ ERRORE: GPRS non risulta connesso dopo setup");
+        return false;
+    }
+    
+    String operatorName = modem.getOperator();
+    IPAddress localIP = modem.localIP();
+    status.signalQuality = getSignalQuality();
+    
+    Serial.printf("\n🎉 === CONNESSIONE STABILITA ===\n");
+    Serial.printf("📡 Operatore: %s\n", operatorName.c_str());
+    Serial.printf("🌐 IP: %s\n", localIP.toString().c_str());
+    Serial.printf("📶 Segnale: %d/5\n", status.signalQuality);
+    Serial.printf("📋 APN: %s\n", config.apn.c_str());
+    Serial.printf("🔗 Server: http://%s:%d\n", config.serverURL.c_str(), config.serverPort);
+    Serial.println("===============================");
+    
+    return true;
+}
+
+void readBatteryLevel() {
+    int adcValue = analogRead(BAT_ADC);
+    
+    // Conversione ADC a voltaggio (considerando partitore 1:2)
+    float voltage = (adcValue / 4095.0) * 3.3 * 2.0;
+    
+    // Conversione voltaggio a percentuale batteria LiPo
+    if (voltage >= 4.1) {
+        status.batteryLevel = 100.0;
+    } else if (voltage >= 3.9) {
+        status.batteryLevel = 80.0 + ((voltage - 3.9) / 0.2) * 20.0;
+    } else if (voltage >= 3.7) {
+        status.batteryLevel = 50.0 + ((voltage - 3.7) / 0.2) * 30.0;
+    } else if (voltage >= 3.5) {
+        status.batteryLevel = 20.0 + ((voltage - 3.5) / 0.2) * 30.0;
+    } else if (voltage >= 3.2) {
+        status.batteryLevel = ((voltage - 3.2) / 0.3) * 20.0;
+    } else {
+        status.batteryLevel = 0.0;
+    }
+    
+    if (status.batteryLevel < 0) status.batteryLevel = 0;
+    if (status.batteryLevel > 100) status.batteryLevel = 100;
+}
+
+void updateStatusLED() {
+    static uint32_t lastBlink = 0;
+    static bool ledState = false;
+    uint32_t now = millis();
+    
+    if (status.lostModeEnabled) {
+        // Lampeggio rapido in modalità smarrito
+        if (now - lastBlink > 200) {
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+            lastBlink = now;
+        }
+    } else {
+        switch (status.state) {
+            case STATE_ONLINE:
+                if (status.isGPSFixed && status.networkState == NET_CONNECTED && 
+                    status.registrationState == REG_COMPLETED) {
+                    // Singolo flash ogni 2 secondi - tutto OK
+                    if (now - lastBlink > 2000) {
+                        digitalWrite(LED_PIN, HIGH);
+                        delay(100);
+                        digitalWrite(LED_PIN, LOW);
+                        lastBlink = now;
+                    }
+                } else {
+                    // Doppio flash ogni 1.5s - online ma GPS o registrazione mancante
+                    if (now - lastBlink > 1500) {
+                        for (int i = 0; i < 2; i++) {
+                            digitalWrite(LED_PIN, HIGH);
+                            delay(100);
+                            digitalWrite(LED_PIN, LOW);
+                            delay(100);
+                        }
+                        lastBlink = now;
+                    }
+                }
+                break;
+                
+            case STATE_NETWORK_CONNECTING:
+            case STATE_GPS_ACQUIRING:
+                // Triplo flash ogni secondo - connessione in corso
+                if (now - lastBlink > 1000) {
+                    for (int i = 0; i < 3; i++) {
+                        digitalWrite(LED_PIN, HIGH);
+                        delay(80);
+                        digitalWrite(LED_PIN, LOW);
+                        delay(80);
+                    }
+                    lastBlink = now;
+                }
+                break;
+                
+            case STATE_ERROR:
+                // LED fisso acceso
+                digitalWrite(LED_PIN, HIGH);
+                break;
+                
+            default:
+                digitalWrite(LED_PIN, LOW);
+                break;
+        }
+    }
+}
+
+void enterSleepMode() {
+    Serial.println("😴 === ATTIVAZIONE SLEEP MODE ===");
+    Serial.printf("🔋 Batteria: %.1f%% - Uptime: %lu ms\n", status.batteryLevel, status.uptime);
+    
+    // Salva stato sleep
+    prefs.putBool("was_sleeping", true);
+    prefs.putULong("sleep_time", millis());
+    
+    // Spegnimento GPS
+    Serial.println("📡 Spegnimento GPS...");
+    SerialAT.println("AT+CGNSPWR=0");
+    delay(3000);
+    
+    // Disconnessione GPRS
+    Serial.println("🌐 Disconnessione GPRS...");
+    modem.gprsDisconnect();
+    delay(2000);
+    
+    // Spegnimento modem
+    Serial.println("📱 Spegnimento modem...");
+    digitalWrite(PWR_PIN, LOW);
+    delay(1000);
+    
+    // Segnalazione LED finale
+    for (int i = 0; i < 5; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(LED_PIN, LOW);
+        delay(200);
+    }
+    
+    Serial.println("💤 Entrando in deep sleep per " + String(DEEP_SLEEP_DURATION) + " secondi...");
+    Serial.flush();
+    
+    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+void handleError(const String& error) {
+    Serial.printf("❌ ERRORE: %s\n", error.c_str());
+    status.errorCount++;
+    status.state = STATE_ERROR;
+    status.httpInProgress = false;
+    
+    // Segnalazione LED errore
+    for (int i = 0; i < 5; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(100);
+        digitalWrite(LED_PIN, LOW);
+        delay(100);
+    }
+}
+
+void printSystemInfo() {
+    Serial.println("📋 === INFORMAZIONI SISTEMA ===");
+    Serial.printf("🆔 Device ID: %s\n", config.deviceId.c_str());
+    Serial.printf("📱 Device Name: %s\n", config.deviceName.c_str());
+    Serial.printf("🌐 Server: http://%s:%d\n", config.serverURL.c_str(), config.serverPort);
+    Serial.printf("⚙️ Firmware: %s\n", config.firmwareVersion.c_str());
+    Serial.printf("🔧 Hardware: %s\n", config.hardwareVersion.c_str());
+    Serial.printf("🆔 Chip ID: %08X\n", (uint32_t)ESP.getEfuseMac());
+    Serial.printf("💾 Flash Size: %d bytes\n", ESP.getFlashChipSize());
+    Serial.printf("🧠 Free Heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("⚡ CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("🔋 Batteria: %.1f%%\n", status.batteryLevel);
+    Serial.printf("🔋 Soglia batteria: %.1f%%\n", config.lowBatteryThreshold);
+    Serial.printf("📡 APN: %s\n", config.apn.c_str());
+    Serial.printf("💓 Heartbeat: %d s\n", config.heartbeatInterval / 1000);
+    Serial.printf("🛰️ GPS: SPENTO (attivato solo su comando)\n");
+    Serial.printf("🚨 GPS (lost mode): %d s\n", config.lostModeInterval / 1000);
+    
+    // Verifica wake up da sleep
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+        Serial.println("⏰ Wake up da deep sleep");
+        bool wasSleeping = prefs.getBool("was_sleeping", false);
+        if (wasSleeping) {
+            uint32_t sleepTime = prefs.getULong("sleep_time", 0);
+            Serial.printf("💤 Sleep duration: %lu ms\n", millis() - sleepTime);
+            prefs.remove("was_sleeping");
+            prefs.remove("sleep_time");
+        }
+    }
+    
+    Serial.println("===============================");
+}
+
+void saveConfigToNVS() {
+    prefs.putString("device_id", config.deviceId);
+    prefs.putString("device_name", config.deviceName);
+    prefs.putString("server_url", config.serverURL);
+    prefs.putString("apn", config.apn);
+    prefs.putString("apn_user", config.apnUser);
+    prefs.putString("apn_pass", config.apnPass);
+    prefs.putUInt("heartbeat_int", config.heartbeatInterval);
+    prefs.putUInt("gps_read_int", config.gpsReadInterval);
+    prefs.putUInt("lost_mode_int", config.lostModeInterval);
+    prefs.putFloat("low_batt_thr", config.lowBatteryThreshold);
+    prefs.putUChar("max_retries", config.maxRetries);
+    prefs.putBool("use_https", config.useHTTPS);
+    prefs.putInt("server_port", config.serverPort);
+    prefs.putString("fw_version", config.firmwareVersion);
+    prefs.putString("hw_version", config.hardwareVersion);
+    prefs.putBool("lost_mode", status.lostModeEnabled);
+    prefs.putBool("geofencing", status.geofencingEnabled);
+    Serial.println("💾 Configurazione salvata in NVS");
+}
+
+
+void loadConfigFromNVS() {
+    config.deviceId = prefs.getString("device_id", config.deviceId);
+    config.deviceName = prefs.getString("device_name", config.deviceName);
+    config.serverURL = prefs.getString("server_url", config.serverURL);
+    config.apn = prefs.getString("apn", config.apn);
+    config.apnUser = prefs.getString("apn_user", config.apnUser);
+    config.apnPass = prefs.getString("apn_pass", config.apnPass);
+    config.heartbeatInterval = prefs.getUInt("heartbeat_int", config.heartbeatInterval);
+    config.gpsReadInterval = prefs.getUInt("gps_read_int", config.gpsReadInterval);
+    config.lostModeInterval = prefs.getUInt("lost_mode_int", config.lostModeInterval);
+    config.lowBatteryThreshold = prefs.getFloat("low_batt_thr", config.lowBatteryThreshold);
+    config.maxRetries = prefs.getUChar("max_retries", config.maxRetries);
+    config.useHTTPS = prefs.getBool("use_https", false);
+    config.serverPort = prefs.getInt("server_port", 3000);
+    config.firmwareVersion = prefs.getString("fw_version", config.firmwareVersion);
+    config.hardwareVersion = prefs.getString("hw_version", config.hardwareVersion);
+    status.lostModeEnabled = prefs.getBool("lost_mode", false);
+    status.geofencingEnabled = prefs.getBool("geofencing", false); 
+    Serial.println("💾 Configurazione caricata da NVS");
+    Serial.printf("🚨 Lost Mode: %s\n", status.lostModeEnabled ? "SI" : "NO");
+    Serial.printf("🌍 Geofencing: %s\n", status.geofencingEnabled ? "SI" : "NO");
+    Serial.printf("📡 APN configurato: %s\n", config.apn.c_str());
+    Serial.printf("🌐 Server: %s:%d\n", config.serverURL.c_str(), config.serverPort);
+}
+
