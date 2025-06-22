@@ -1,20 +1,40 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Satellite, Settings, Wifi, ChevronDown, Map, History, Command, LogOut, User } from "lucide-react";
-import { useAuth } from "@/hooks/useAuth";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import StatusDashboard from "@/components/status-dashboard";
-import MapboxMap from "@/components/mapbox-map";
-import TraceHistory from "@/components/trace-history";
-import SystemLogs from "@/components/system-logs";
-import GeofenceManager from "@/components/geofence-manager";
-import DeviceCommands from "@/components/device-commands";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { Device, DeviceLocation } from "@shared/schema";
+import { useState, useEffect } from 'react'; // ← AGGIUNTO: useEffect
+import { useQuery } from '@tanstack/react-query';
+import {
+  Satellite,
+  Settings,
+  Wifi,
+  ChevronDown,
+  Map,
+  History,
+  Command,
+  LogOut,
+  User,
+} from 'lucide-react';
+import { useAuth } from '@/hooks/useAuth';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import StatusDashboard from '@/components/status-dashboard';
+import TraceHistory from '@/components/trace-history';
+import SystemLogs from '@/components/system-logs';
+import GeofenceManager from '@/components/geofence-manager';
+import DeviceCommands from '@/components/device-commands';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import type { Device, DeviceLocation } from '@shared/schema';
 
-export default async function Dashboard() {
+export default function Dashboard() {
+  // ← RIMOSSO: async
   const { user } = useAuth();
   const { data: devices, isLoading } = useQuery<Device[]>({
     queryKey: ['/api/devices'],
@@ -24,6 +44,13 @@ export default async function Dashboard() {
   const [activeTab, setActiveTab] = useState<
     'dashboard' | 'map' | 'history' | 'settings'
   >('dashboard');
+
+  // ← AGGIUNTO: Auto-select first device quando devices sono caricati
+  useEffect(() => {
+    if (devices && devices.length > 0 && !selectedDeviceId) {
+      setSelectedDeviceId(devices[0].deviceId);
+    }
+  }, [devices, selectedDeviceId]);
 
   const handleLogout = async () => {
     try {
@@ -45,11 +72,12 @@ export default async function Dashboard() {
     error: deviceStatusError,
     isLoading: isLastDeviceInfoLoading,
   } = useQuery<any>({
-    queryKey: [`/api/devices/${device!.deviceId}/status-history?limit=1`],
+    queryKey: [`/api/devices/${device?.deviceId}/status-history?limit=1`], // ← AGGIUNTO: ? per null safety
     queryFn: () =>
       fetch(`/api/devices/${device!.deviceId}/status-history?limit=1`).then(
         (res) => res.json()
       ),
+    enabled: !!device?.deviceId, // ← AGGIUNTO: Previene query con device undefined
   });
 
   const isLostMode = lastDeviceInfo?.length
@@ -124,7 +152,9 @@ export default async function Dashboard() {
             </SelectTrigger>
             <SelectContent>
               {devices.map((d) => (
-                <SelectItem key={d.id} value={d.id.toString()}>
+                <SelectItem key={d.id} value={d.deviceId}>
+                  {' '}
+                  {/* ← CORRETTO: value={d.deviceId} invece di d.id.toString() */}
                   <div className="flex items-center space-x-3">
                     <div
                       className={`w-2 h-2 rounded-full ${
